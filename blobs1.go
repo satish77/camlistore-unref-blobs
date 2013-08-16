@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	//"reflect"
+	"syscall"
 )
 
 // camliTypes
@@ -23,13 +24,14 @@ const (
 type BlobRef string
 
 type BlobType struct {
-	sha1         BlobRef
 	camliContent BlobRef
 	camliType    int
 	constant     string
-	entries      BlobRef
+	entries      string
+	members      []string
 	parts        []PartType
-	permanode    BlobRef
+	permaNode    BlobRef
+	path         string
 }
 
 type PartType struct {
@@ -45,36 +47,35 @@ var reachableBlobs map[string]int
 
 var blobs map[BlobRef]BlobType
 
+func fileToBlobRef(camliFile string) BlobRef {
+	return BlobRef(camliFile[0 : len(camliFile)-len(filepath.Ext(camliFile))])
+}
+
 func printCamliTypes() {
 	for camliType := range camliTypesCnt {
-		fmt.Println(camliType, camliTypesCnt[camliType])
+		fmt.Println(camliTypes[camliType], camliType, camliTypesCnt[camliType])
 	}
 }
 
 func printCamliFilesByType(camliType string) {
 	fmt.Println(camliType)
 	for camliFile := range camliFiles[camliType] {
-		fmt.Println(camliFile)
+		fmt.Println(blobs[fileToBlobRef(camliFile)].path)
 	}
 }
 
 func processCamliFile(path string) {
-	fmt.Println(path)
+	//fmt.Println(path)
 	content, err := ioutil.ReadFile(path)
 	if err != nil {
 		panic(err)
 	}
 
-	// load json
 	u := map[string]interface{}{}
 	err = json.Unmarshal(content, &u)
 	if err != nil {
 		panic(err)
 	}
-	// Type assert values
-	// Unmarshal stores "age" as a float even though it's an int.
-	//fmt.Printf("Age: %1.0f\n", u["age"].(float64))
-	//fmt.Printf("Married: %v\n", u["married"].(bool))
 
 	camliType := u["camliType"].(string)
 
@@ -91,33 +92,59 @@ func processCamliFile(path string) {
 	}
 	camliTypesCnt[camliType] = camliTypesCnt[camliType] + 1
 
-	blobRef := BlobRef(filepath.Base(path))
+	filename := filepath.Base(path)
+
+	blobRef := BlobRef(filename[0 : len(filename)-len(filepath.Ext(filename))])
+	//fmt.Println(blobRef)
+
 	var b BlobType
-	b.sha1 = blobRef
-	if u["camliContent"] != nil {
-		b.camliContent = u["camliContent"].(BlobRef)
+	//b.sha1 = blobRef
+	b.path = path
+
+	var ok bool
+	b.camliType, ok = camliTypes[camliType]
+	if !ok {
+		panic(camliType + " not found.")
 	}
-	b.camliType = camliTypes[camliType]
+
 	if u["entries"] != nil {
-		b.entries = BlobRef(u["entries"].(string))
+		b.entries = u["entries"].(string)
 	}
 
 	if u["parts"] != nil {
-		fmt.Println(u["parts"])
+		//fmt.Println(u["parts"])
 		//fmt.Println(reflect.TypeOf(u["parts"]))
-		for _, v := range(u["parts"].([]interface{})) {
-			fmt.Println(v)
+		for _, v := range u["parts"].([]interface{}) {
+			//fmt.Println(v)
 			partBlobRef := v.(map[string]interface{})["blobRef"]
 			partSize := v.(map[string]interface{})["size"]
 			if partBlobRef == nil {
 				partBlobRef = v.(map[string]interface{})["bytesRef"]
+				//fmt.Println("bytesRef: " + v.(map[string]interface{})["bytesRef"].(string))
 			}
-			fmt.Printf("%T %T\n", partBlobRef, partSize) // string float64
-			b.parts = append(b.parts, (PartType { sha1: partBlobRef.(string), size: partSize.(float64) }))
+			//fmt.Printf("%T %T\n", partBlobRef, partSize) // string float64
+			b.parts = append(b.parts, (PartType{sha1: partBlobRef.(string), size: partSize.(float64)}))
 		}
 	}
+
+	if u["members"] != nil {
+		//fmt.Println(u["members"])
+		//fmt.Printf("%T\n", u["members"].([]interface{}))
+		for _, member := range u["members"].([]interface{}) {
+			//fmt.Printf("%T\n", member)
+			b.members = append(b.members, member.(string))
+		}
+		//fmt.Println(b.members)
+	}
+
+	if u["attribute"] != nil {
+		if u["attribute"].(string) == "camliContent" {
+			b.camliContent = BlobRef(u["value"].(string))
+		}
+	}
+
 	if u["permanode"] != nil {
-		b.permanode = u["permanode"].(BlobRef)
+		b.permaNode = u["permanode"].(BlobRef)
 	}
 	blobs[blobRef] = b
 }
@@ -152,7 +179,7 @@ func visit(path string, fi os.FileInfo, err error) error {
 	}
 	defer f.Close() // f.Close will run when we're finished.
 
-	//	pattern := "{\"camliVersion\": 1,"
+	//  pattern := "{\"camliVersion\": 1,"
 	buf := make([]byte, 20)
 	_, err = f.Read(buf[0:])
 
@@ -173,38 +200,46 @@ func visit(path string, fi os.FileInfo, err error) error {
 var BlobRefCount map[BlobRef]int
 
 func WalkBlob(blobRef BlobRef) {
+	//return
 	if blobRef == "" {
 		return
 	}
+	//fmt.Println(blobRef, blobs[blobRef].camliType)
 
 	BlobRefCount[blobRef]++
 
 	switch blobs[blobRef].camliType {
-	case permanode:
-		WalkBlob(blobs[blobRef].camliContent)
-		/*	case static_set:
-			case directory:
-				for _, entry := range(blobs[blobRef].entries) {
-					WalkBlob(entry)
-				}*/
 	case claim:
-		if _, ok := blobs[blobs[blobRef].permanode]; ok {
-			BlobRefCount[blobRef] = BlobRefCount[blobRef] + 1
+		WalkBlob(blobs[blobRef].permaNode)
+		WalkBlob(blobs[blobRef].camliContent)
+	case static_set:
+		for _, member := range blobs[blobRef].members {
+			WalkBlob(BlobRef(member))
 		}
+	case file:
+		for _, part := range blobs[blobRef].parts {
+			WalkBlob(BlobRef(part.sha1))
+		}
+	case bytes:
+		for _, part := range blobs[blobRef].parts {
+			WalkBlob(BlobRef(part.sha1))
+		}
+	case directory:
+		WalkBlob(BlobRef(blobs[blobRef].entries))
+	case permanode:
 	}
 }
 
 func DeletePermanode(deletednode BlobRef) {
-	for k, v := range blobs {
-		if (v.camliType == permanode) && (v.sha1 != deletednode) {
-			WalkBlob(v.sha1)
-		}
-		if blobs[k].camliType == claim {
-			WalkBlob(v.sha1)
+	for k, _ := range blobs {
+		//fmt.Println(k)
+		if (blobs[k].camliType == claim) && (blobs[k].permaNode != deletednode) {
+			WalkBlob(k)
 		}
 	}
 	/* print the blobs that can be deleted */
 	for blobRef := range BlobRefCount {
+		fmt.Println(blobRef, BlobRefCount[blobRef], blobs[blobRef].camliType)
 		if BlobRefCount[blobRef] == 0 {
 			fmt.Println(blobRef + " deleted")
 		}
@@ -217,13 +252,18 @@ func main() {
 	flag.Parse()
 	root := flag.Arg(0)
 
+	appdata, _ := syscall.Getenv("APPDATA")
+	root = appdata + "\\camlistore\\blobs\\sha1"
+
 	blobs = make(map[BlobRef]BlobType)
 
 	camliTypes = make(map[string]int)
 	camliTypes["file"] = file
+	camliTypes["bytes"] = bytes
 	camliTypes["static-set"] = static_set
 	camliTypes["directory"] = directory
 	camliTypes["permanode"] = permanode
+	camliTypes["claim"] = claim
 
 	camliFileChan = make(chan string)
 
@@ -231,10 +271,13 @@ func main() {
 
 	if filepath.Walk(root, visit) == nil {
 		camliFileChan <- "quit"
-		//printCamliFilesByType("permanode")
-		//printCamliFilesByType("directory")
+		printCamliFilesByType("permanode")
+		printCamliFilesByType("claim")
 		printCamliTypes()
 	}
+
+	BlobRefCount = make(map[BlobRef]int)
+	DeletePermanode("sha1-8c0d7c406bf39adb4903b8bdb7263c0680d4a03c")
 
 	fmt.Println("Finished.")
 }

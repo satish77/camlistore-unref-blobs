@@ -1,1 +1,1 @@
-go run blobs1.go %APPDATA%/Camlistore/blobs/sha1
+go run blobs1.go %APPDATA%\Camlistore\blobs\sha1
