@@ -8,7 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	//"reflect"
-	"syscall"
+	"sort"
+	//"syscall"
 )
 
 // camliTypes
@@ -39,28 +40,40 @@ type PartType struct {
 	size float64
 }
 
-type camliTypeMap map[string]string
-
-var camliFiles map[string]camliTypeMap
-var camliTypesCnt map[string]int
-var reachableBlobs map[string]int
-
+var camliTypes map[string]int
 var blobs map[BlobRef]BlobType
+
+func camliTypeLookup(value int) string {
+	for k, v := range camliTypes {
+		if v == value {
+			return k
+		}
+	}
+	return "binary"
+}
 
 func fileToBlobRef(camliFile string) BlobRef {
 	return BlobRef(camliFile[0 : len(camliFile)-len(filepath.Ext(camliFile))])
 }
 
 func printCamliTypes() {
-	for camliType := range camliTypesCnt {
-		fmt.Println(camliTypes[camliType], camliType, camliTypesCnt[camliType])
+	TypeCnt := make(map[int]int)
+
+	for blobref := range blobs {
+		TypeCnt[blobs[blobref].camliType]++
+	}
+	for camliType := range TypeCnt {
+		fmt.Println(camliTypeLookup(camliType), TypeCnt[camliType])
 	}
 }
 
 func printCamliFilesByType(camliType string) {
 	fmt.Println(camliType)
-	for camliFile := range camliFiles[camliType] {
-		fmt.Println(blobs[fileToBlobRef(camliFile)].path)
+	camliTypeInt, _ := camliTypes[camliType]
+	for blob := range blobs {
+		if blobs[blob].camliType == camliTypeInt {
+			fmt.Println(blobs[blob].path)
+		}
 	}
 }
 
@@ -71,6 +84,19 @@ func processCamliFile(path string) {
 		panic(err)
 	}
 
+	var b BlobType
+	b.path = path
+	filename := filepath.Base(path)
+	blobRef := BlobRef(filename[0 : len(filename)-len(filepath.Ext(filename))])
+	//fmt.Println(blobRef)
+
+	pattern := "{\"camliVersion\": 1,"
+	if string(content[0:len(pattern)]) != pattern {
+		//fmt.Println("Binary: ", path)
+		blobs[blobRef] = b
+		return
+	}
+
 	u := map[string]interface{}{}
 	err = json.Unmarshal(content, &u)
 	if err != nil {
@@ -78,28 +104,6 @@ func processCamliFile(path string) {
 	}
 
 	camliType := u["camliType"].(string)
-
-	if camliFiles == nil {
-		camliFiles = make(map[string]camliTypeMap)
-	}
-	if camliFiles[camliType] == nil {
-		camliFiles[camliType] = make(camliTypeMap)
-	}
-	camliFiles[camliType][filepath.Base(path)] = path
-
-	if camliTypesCnt == nil {
-		camliTypesCnt = make(map[string]int)
-	}
-	camliTypesCnt[camliType] = camliTypesCnt[camliType] + 1
-
-	filename := filepath.Base(path)
-
-	blobRef := BlobRef(filename[0 : len(filename)-len(filepath.Ext(filename))])
-	//fmt.Println(blobRef)
-
-	var b BlobType
-	//b.sha1 = blobRef
-	b.path = path
 
 	var ok bool
 	b.camliType, ok = camliTypes[camliType]
@@ -143,8 +147,8 @@ func processCamliFile(path string) {
 		}
 	}
 
-	if u["permanode"] != nil {
-		b.permaNode = u["permanode"].(BlobRef)
+	if u["permaNode"] != nil {
+		b.permaNode = BlobRef(u["permaNode"].(string))
 	}
 	blobs[blobRef] = b
 }
@@ -164,34 +168,8 @@ func processCamliFileTask() {
 }
 
 func visit(path string, fi os.FileInfo, err error) error {
-	if fi.IsDir() {
-		return nil
-	}
-
-	if reachableBlobs == nil {
-		reachableBlobs = make(map[string]int)
-	}
-
-	var f *os.File
-	f, err = os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close() // f.Close will run when we're finished.
-
-	//  pattern := "{\"camliVersion\": 1,"
-	buf := make([]byte, 20)
-	_, err = f.Read(buf[0:])
-
-	if err == nil {
-		firstLine := string(buf)
-		//fmt.Printf("%v %s\n", buf, firstLine)
-		if firstLine == "{\"camliVersion\": 1,\n" {
-			//fmt.Printf("%s\n", fi.Name())
-			//processCamliFile(path, fi.Name())
-			reachableBlobs[fi.Name()] = 0
-			camliFileChan <- path
-		}
+	if !fi.IsDir() {
+		camliFileChan <- path
 	}
 
 	return nil
@@ -200,11 +178,10 @@ func visit(path string, fi os.FileInfo, err error) error {
 var BlobRefCount map[BlobRef]int
 
 func WalkBlob(blobRef BlobRef) {
-	//return
 	if blobRef == "" {
 		return
 	}
-	//fmt.Println(blobRef, blobs[blobRef].camliType)
+	//fmt.Println("WalkBlob: ", blobRef, blobs[blobRef].camliType)
 
 	BlobRefCount[blobRef]++
 
@@ -230,30 +207,68 @@ func WalkBlob(blobRef BlobRef) {
 	}
 }
 
-func DeletePermanode(deletednode BlobRef) {
+func RemovePermanode(removedNode BlobRef) {
+	// initialize ref count to zero
 	for k, _ := range blobs {
-		//fmt.Println(k)
-		if (blobs[k].camliType == claim) && (blobs[k].permaNode != deletednode) {
-			WalkBlob(k)
-		}
+		BlobRefCount[k] = 0
 	}
-	/* print the blobs that can be deleted */
-	for blobRef := range BlobRefCount {
-		fmt.Println(blobRef, BlobRefCount[blobRef], blobs[blobRef].camliType)
-		if BlobRefCount[blobRef] == 0 {
-			fmt.Println(blobRef + " deleted")
+	for k, _ := range blobs {
+		if blobs[k].camliType == claim {
+			//fmt.Println(blobs[k].camliType, blobs[k])
+			if blobs[k].permaNode != removedNode {
+				WalkBlob(k)
+			}
 		}
 	}
 }
 
-var camliTypes map[string]int
+func printUnrefBlobs() {
+	fmt.Println("Unreferenced Blobs:-")
+	unrefCount := 0
+	/* print the blobs that can be deleted */
+	for blobRef := range BlobRefCount {
+		//fmt.Println(blobRef, BlobRefCount[blobRef], camliTypeLookup(blobs[blobRef].camliType))
+		if BlobRefCount[blobRef] == 0 {
+			//fmt.Println(blobRef)
+			unrefCount++
+		}
+	}
+	fmt.Println(unrefCount, "of", len(BlobRefCount), "can be removed.")
+}
+
+func blobRefHist() {
+	// create histogram
+	hist := make(map[int]int)
+	for blobRef := range BlobRefCount {
+		hist[BlobRefCount[blobRef]]++
+	}
+
+	// print histogram
+	fmt.Println("Histogram: count -> number of blobs")
+	for k, v := range hist {
+		fmt.Println(k, v)
+	}
+
+	// extract keys
+	keys := make([]int, 0)
+	for freq, _ := range hist {
+		keys = append(keys, freq)
+	}
+
+	fmt.Println("Histogram: count(sorted) -> number of blobs")
+	// sort keys and print
+	sort.Ints(keys)
+	for key := range keys {
+		fmt.Println(keys[key], hist[keys[key]])
+	}
+}
 
 func main() {
 	flag.Parse()
 	root := flag.Arg(0)
 
-	appdata, _ := syscall.Getenv("APPDATA")
-	root = appdata + "\\camlistore\\blobs\\sha1"
+	//appdata, _ := syscall.Getenv("APPDATA")
+	//root = appdata + "\\camlistore\\blobs\\sha1"
 
 	blobs = make(map[BlobRef]BlobType)
 
@@ -277,7 +292,10 @@ func main() {
 	}
 
 	BlobRefCount = make(map[BlobRef]int)
-	DeletePermanode("sha1-8c0d7c406bf39adb4903b8bdb7263c0680d4a03c")
+	//RemovePermanode("sha1-8c0d7c406bf39adb4903b8bdb7263c0680d4a03c")
+	RemovePermanode("")
+	printUnrefBlobs()
+	//blobRefHist()
 
 	fmt.Println("Finished.")
 }
